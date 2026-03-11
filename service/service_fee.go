@@ -3,8 +3,10 @@ package service
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -29,17 +31,16 @@ func ChargeServiceFee(ctx context.Context, userId int, providerCostQuota int64) 
 	settings := operation_setting.GetServiceFeeSetting()
 	result := ServiceFeeResult{ProviderCost: providerCostQuota}
 
-	// Step B: calculate raw service fee for this request
-	rawFee := int64(float64(providerCostQuota) * settings.PlatformServiceFeeRate)
+	// Step B: calculate raw service fee using Ceil to avoid truncation to zero
+	// on small requests (e.g. 5 quota * 0.01 = 0.05 → ceil → 1)
+	rawFee := int64(math.Ceil(float64(providerCostQuota) * settings.PlatformServiceFeeRate))
 	if rawFee <= 0 {
-		// No fee to charge (free model or zero cost)
 		return result, nil
 	}
 
 	cap := settings.MonthlyServiceFeeCap
 
 	err := model.DB.Transaction(func(tx *gorm.DB) error {
-		// Lock the user row for update
 		var user model.User
 		if err := tx.Set("gorm:query_option", "FOR UPDATE").
 			Select("id, month_fee_total, last_fee_reset_time, quota").
@@ -48,7 +49,7 @@ func ChargeServiceFee(ctx context.Context, userId int, providerCostQuota int64) 
 			return err
 		}
 
-		// Step A: monthly reset check
+		// Step A: monthly reset — compare Year+Month of now vs last reset
 		now := time.Now()
 		lastReset := time.Unix(user.LastFeeResetTime, 0)
 		if now.Year() != lastReset.Year() || now.Month() != lastReset.Month() {
@@ -59,11 +60,9 @@ func ChargeServiceFee(ctx context.Context, userId int, providerCostQuota int64) 
 		// Step C: cap enforcement
 		var actualFee int64
 		if user.MonthFeeTotal >= cap {
-			// Already at cap — no fee
 			result.CapReached = true
 			actualFee = 0
 		} else if user.MonthFeeTotal+rawFee > cap {
-			// Would exceed cap — charge only the remainder
 			actualFee = cap - user.MonthFeeTotal
 			result.CapPartial = true
 		} else {
@@ -72,23 +71,23 @@ func ChargeServiceFee(ctx context.Context, userId int, providerCostQuota int64) 
 
 		result.ServiceFee = actualFee
 
+		// Step D: atomic quota deduction + accumulator update
 		if actualFee > 0 {
-			// Step D: atomic deduct quota + update monthly accumulator
 			if err := tx.Model(&model.User{}).
 				Where("id = ?", userId).
 				Updates(map[string]interface{}{
-					"quota":              gorm.Expr("quota - ?", actualFee),
-					"month_fee_total":    gorm.Expr("month_fee_total + ?", actualFee),
+					"quota":               gorm.Expr("quota - ?", actualFee),
+					"month_fee_total":     gorm.Expr("month_fee_total + ?", actualFee),
 					"last_fee_reset_time": user.LastFeeResetTime,
 				}).Error; err != nil {
 				return err
 			}
-		} else if user.LastFeeResetTime != 0 {
-			// Still persist the reset timestamp even if no fee charged
+		} else {
+			// Persist reset timestamp even when no fee is charged
 			if err := tx.Model(&model.User{}).
 				Where("id = ?", userId).
 				Updates(map[string]interface{}{
-					"month_fee_total":    user.MonthFeeTotal,
+					"month_fee_total":     user.MonthFeeTotal,
 					"last_fee_reset_time": user.LastFeeResetTime,
 				}).Error; err != nil {
 				return err
@@ -102,13 +101,23 @@ func ChargeServiceFee(ctx context.Context, userId int, providerCostQuota int64) 
 		return result, fmt.Errorf("service fee transaction failed: %w", err)
 	}
 
-	// Log the breakdown
+	// Step E: record service fee as a separate log entry with both fields explicit
+	// so billing UI can display provider_cost and service_fee independently
 	capStatus := "no"
 	if result.CapReached {
 		capStatus = "cap_reached"
 	} else if result.CapPartial {
 		capStatus = "cap_partial"
 	}
+
+	logOther := map[string]interface{}{
+		"provider_cost": result.ProviderCost,
+		"service_fee":   result.ServiceFee,
+		"cap_status":    capStatus,
+		"log_type":      "service_fee",
+	}
+	model.RecordLog(userId, model.LogTypeConsume, common.MapToJsonStr(logOther))
+
 	logger.LogInfo(ctx, fmt.Sprintf(
 		"service_fee: provider_cost=%d service_fee=%d cap_status=%s",
 		result.ProviderCost, result.ServiceFee, capStatus,
