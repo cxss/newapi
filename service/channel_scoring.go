@@ -174,3 +174,15 @@ func getAllAvailableChannelsFromCache(group string, modelName string) ([]*model.
 func getAllAvailableChannelsFromDB(group string, modelName string) ([]*model.Channel, error) {
 	return model.GetChannelsByGroupAndModel(group, modelName)
 }
+
+// TriggerChannelPenalty immediately applies a failure metric update to a channel
+// when a real request encounters a 429 or 5xx response. This ensures the scoring
+// system reacts to live errors without waiting for the next prober cycle.
+func TriggerChannelPenalty(channelId int, httpStatusCode int) {
+	ch, err := model.GetChannelById(channelId, true)
+	if err != nil || ch == nil {
+		return
+	}
+	// Use a high latency sentinel (10s) to also penalize latency score
+	_ = ch.UpdateMetrics(10000, false)
+}

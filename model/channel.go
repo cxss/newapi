@@ -1091,3 +1091,16 @@ func CountChannelsGroupByType() (map[int64]int64, error) {
 	}
 	return counts, nil
 }
+
+// GetEnabledChannelsForProbe returns all channels eligible for probe testing:
+// enabled channels plus temp-disabled channels that are in their recovery probe window.
+func GetEnabledChannelsForProbe() ([]*Channel, error) {
+	var channels []*Channel
+	now := common.GetTimestamp()
+	// Include: status=enabled OR (temp_disabled_until > 0 AND now >= temp_disabled_until AND now < temp_disabled_until+60)
+	err := DB.Where(
+		"status = ? OR (temp_disabled_until > 0 AND ? >= temp_disabled_until AND ? < temp_disabled_until + 60)",
+		common.ChannelStatusEnabled, now, now,
+	).Find(&channels).Error
+	return channels, err
+}
