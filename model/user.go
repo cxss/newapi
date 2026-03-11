@@ -50,6 +50,9 @@ type User struct {
 	Setting          string         `json:"setting" gorm:"type:text;column:setting"`
 	Remark           string         `json:"remark,omitempty" gorm:"type:varchar(255)" validate:"max=255"`
 	StripeCustomer   string         `json:"stripe_customer" gorm:"type:varchar(64);column:stripe_customer;index"`
+	// Service fee tracking
+	MonthFeeTotal    int64          `json:"month_fee_total" gorm:"bigint;default:0"`     // accumulated service fee this month (in Quota units)
+	LastFeeResetTime int64          `json:"last_fee_reset_time" gorm:"bigint;default:0"` // unix timestamp of last monthly reset
 }
 
 func (user *User) ToBaseUser() *UserBase {

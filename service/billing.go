@@ -31,6 +31,7 @@ func PreConsumeBilling(c *gin.Context, preConsumedQuota int, relayInfo *relaycom
 
 // SettleBilling 执行计费结算。如果 RelayInfo 上有 BillingSession 则通过 session 结算，
 // 否则回退到旧的 PostConsumeQuota 路径（兼容按次计费等场景）。
+// 结算完成后，若 actualQuota > 0 且为钱包计费，额外收取平台服务费。
 func SettleBilling(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, actualQuota int) error {
 	if relayInfo.Billing != nil {
 		preConsumed := relayInfo.Billing.GetPreConsumedQuota()
@@ -66,13 +67,37 @@ func SettleBilling(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, actualQuo
 				checkAndSendQuotaNotify(relayInfo, actualQuota-preConsumed, preConsumed)
 			}
 		}
-		return nil
+	} else {
+		// 回退：无 BillingSession 时使用旧路径
+		quotaDelta := actualQuota - relayInfo.FinalPreConsumedQuota
+		if quotaDelta != 0 {
+			if err := PostConsumeQuota(relayInfo, quotaDelta, relayInfo.FinalPreConsumedQuota, true); err != nil {
+				return err
+			}
+		}
 	}
 
-	// 回退：无 BillingSession 时使用旧路径
-	quotaDelta := actualQuota - relayInfo.FinalPreConsumedQuota
-	if quotaDelta != 0 {
-		return PostConsumeQuota(relayInfo, quotaDelta, relayInfo.FinalPreConsumedQuota, true)
+	// 平台服务费：仅对钱包计费且有实际消耗时收取
+	if actualQuota > 0 && relayInfo.BillingSource != BillingSourceSubscription && relayInfo.UserId > 0 {
+		feeResult, err := ChargeServiceFee(ctx, relayInfo.UserId, int64(actualQuota))
+		if err != nil {
+			// 服务费失败不阻断主流程，仅记录错误
+			logger.LogError(ctx, fmt.Sprintf("service fee charge failed: %s", err.Error()))
+		} else {
+			capNote := ""
+			if feeResult.CapReached {
+				capNote = "（已达月度封顶，免收）"
+			} else if feeResult.CapPartial {
+				capNote = "（触发月度封顶，仅收差额）"
+			}
+			logger.LogInfo(ctx, fmt.Sprintf(
+				"平台服务费：原始成本=%s 本笔服务费=%s%s",
+				logger.FormatQuota(int(feeResult.ProviderCost)),
+				logger.FormatQuota(int(feeResult.ServiceFee)),
+				capNote,
+			))
+		}
 	}
+
 	return nil
 }
