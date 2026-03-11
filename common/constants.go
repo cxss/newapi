@@ -206,6 +206,13 @@ const (
 	ChannelStatusEnabled          = 1 // don't use 0, 0 is the default value!
 	ChannelStatusManuallyDisabled = 2 // also don't use 0
 	ChannelStatusAutoDisabled     = 3
+	ChannelStatusTempDisabled     = 4 // temporarily disabled due to consecutive failures
+
+	// Smart routing thresholds
+	ChannelConsecutiveFailThreshold = 3               // consecutive failures before temp disable
+	ChannelTempDisableDuration      = 5 * 60          // seconds (5 minutes cooldown)
+	ChannelLowSuccessRateThreshold  = 0.90            // below this triggers score penalty
+	ChannelLowSuccessRatePenalty    = 10.0            // score penalty multiplier for unhealthy channels
 )
 
 const (

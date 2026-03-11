@@ -54,9 +54,11 @@ type Channel struct {
 	OtherSettings string `json:"settings" gorm:"column:settings"` // 其他设置，存储azure版本等不需要检索的信息，详见dto.ChannelOtherSettings
 
 	// Smart routing metrics
-	Latency       *int     `json:"latency" gorm:"default:0"`        // Average latency in milliseconds
-	SuccessRate   *float64 `json:"success_rate" gorm:"default:1.0"` // Success rate (0.0 - 1.0)
-	LastCheckTime int64    `json:"last_check_time" gorm:"bigint;default:0"`
+	Latency            *int     `json:"latency" gorm:"default:0"`              // Average latency in milliseconds
+	SuccessRate        *float64 `json:"success_rate" gorm:"default:1.0"`       // Success rate (0.0 - 1.0)
+	LastCheckTime      int64    `json:"last_check_time" gorm:"bigint;default:0"`
+	ConsecutiveFails   int      `json:"consecutive_fails" gorm:"default:0"`    // consecutive failure count
+	TempDisabledUntil  int64    `json:"temp_disabled_until" gorm:"bigint;default:0"` // unix timestamp, 0 = not disabled
 
 	// cache info
 	Keys []string `json:"-" gorm:"-"`
@@ -488,8 +490,44 @@ func (channel *Channel) UpdateMetrics(latency int, success bool) error {
 	// Update last check time
 	channel.LastCheckTime = common.GetTimestamp()
 
-	// Save to database
-	return DB.Model(channel).Select("latency", "success_rate", "last_check_time").Updates(channel).Error
+	// Update consecutive failure count and temp disable logic
+	if success {
+		channel.ConsecutiveFails = 0
+		// If recovering from temp disable (probe succeeded), clear it
+		if channel.TempDisabledUntil > 0 {
+			channel.TempDisabledUntil = 0
+		}
+	} else {
+		channel.ConsecutiveFails++
+		if channel.ConsecutiveFails >= common.ChannelConsecutiveFailThreshold {
+			// Temp disable for cooldown duration
+			channel.TempDisabledUntil = common.GetTimestamp() + int64(common.ChannelTempDisableDuration)
+			channel.ConsecutiveFails = 0 // reset so next probe starts fresh
+		}
+	}
+
+	return DB.Model(channel).Select(
+		"latency", "success_rate", "last_check_time",
+		"consecutive_fails", "temp_disabled_until",
+	).Updates(channel).Error
+}
+
+// IsTempDisabled returns true if the channel is currently in cooldown
+func (channel *Channel) IsTempDisabled() bool {
+	if channel.TempDisabledUntil == 0 {
+		return false
+	}
+	return common.GetTimestamp() < channel.TempDisabledUntil
+}
+
+// IsProbeCandidate returns true if the channel just exited cooldown and should get a probe attempt
+func (channel *Channel) IsProbeCandidate() bool {
+	if channel.TempDisabledUntil == 0 {
+		return false
+	}
+	now := common.GetTimestamp()
+	// Within 60s after cooldown expiry = probe window
+	return now >= channel.TempDisabledUntil && now < channel.TempDisabledUntil+60
 }
 
 func (channel *Channel) Insert() error {

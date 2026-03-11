@@ -17,74 +17,94 @@ type ChannelScore struct {
 
 // ScoringWeights defines the weights for different factors in channel scoring
 type ScoringWeights struct {
-	PriceWeight       float64 // Weight for price (cost)
-	LatencyWeight     float64 // Weight for latency
-	FailureRateWeight float64 // Weight for failure rate
+	PriceWeight       float64
+	LatencyWeight     float64
+	FailureRateWeight float64
 }
 
 // DefaultScoringWeights returns the default weights with cost as highest priority (70%)
 func DefaultScoringWeights() ScoringWeights {
 	return ScoringWeights{
-		PriceWeight:       0.70, // 70% - Cost is the highest priority
-		LatencyWeight:     0.15, // 15% - Latency is secondary
-		FailureRateWeight: 0.15, // 15% - Failure rate is tertiary
+		PriceWeight:       0.70,
+		LatencyWeight:     0.15,
+		FailureRateWeight: 0.15,
 	}
 }
 
-// CalculateChannelScore calculates a composite score for a channel
-// Lower score is better (represents lower cost and better performance)
-// Formula: score = W_p × NormalizedPrice + W_l × NormalizedLatency + W_f × FailureRate
+// isChannelRoutable returns true if the channel should participate in routing.
+// Manually/auto disabled channels are always excluded.
+// Temp-disabled channels are excluded, UNLESS they are in the probe window
+// (just exited cooldown) — those are allowed through as probe candidates.
+func isChannelRoutable(channel *model.Channel) bool {
+	if channel.Status == common.ChannelStatusManuallyDisabled ||
+		channel.Status == common.ChannelStatusAutoDisabled {
+		return false
+	}
+	// Allow probe candidates through even though TempDisabledUntil is set
+	if channel.IsTempDisabled() && !channel.IsProbeCandidate() {
+		return false
+	}
+	return true
+}
+
+// CalculateChannelScore calculates a composite score for a channel.
+// Lower score is better. Channels with success rate < 90% receive a heavy penalty.
 func CalculateChannelScore(channel *model.Channel, modelName string, weights ScoringWeights) float64 {
-	// Get model price (quota per 1000 tokens)
 	modelPrice := ratio_setting.GetModelPrice(modelName, false)
 	if modelPrice == 0 {
-		modelPrice = 1.0 // Default price if not found
+		modelPrice = 1.0
 	}
-
-	// Apply channel's model ratio if exists
 	channelModelRatio := ratio_setting.GetChannelModelRatio(channel.Type, modelName)
 	effectivePrice := modelPrice * channelModelRatio
 
-	// Normalize price (assuming typical range 0-100 quota per 1000 tokens)
-	// Use logarithmic scale to handle wide price ranges
+	// Logarithmic price normalization (range 0-100)
 	normalizedPrice := math.Log1p(effectivePrice) / math.Log1p(100.0)
 	if normalizedPrice > 1.0 {
 		normalizedPrice = 1.0
 	}
 
-	// Get and normalize latency (assuming typical range 0-5000ms)
+	// Latency normalization (range 0-5000ms)
 	latency := float64(channel.GetLatency())
 	normalizedLatency := latency / 5000.0
 	if normalizedLatency > 1.0 {
 		normalizedLatency = 1.0
 	}
 
-	// Get failure rate (1.0 - success_rate)
 	successRate := channel.GetSuccessRate()
 	failureRate := 1.0 - successRate
 
-	// Calculate composite score
 	score := weights.PriceWeight*normalizedPrice +
 		weights.LatencyWeight*normalizedLatency +
 		weights.FailureRateWeight*failureRate
 
+	// Health penalty: success rate < 90% triggers heavy score penalty
+	// so the system avoids this channel unless no better option exists
+	if successRate < common.ChannelLowSuccessRateThreshold {
+		score += common.ChannelLowSuccessRatePenalty * failureRate
+	}
+
+	// Probe candidates (just exited cooldown) get a score bump so they are
+	// tried last among healthy channels but still ahead of truly unhealthy ones
+	if channel.IsProbeCandidate() {
+		score += 0.5
+	}
+
 	return score
 }
 
-// GetScoredChannels returns channels sorted by score (lowest/best first)
+// GetScoredChannels filters unroutable channels then scores and sorts the rest.
 func GetScoredChannels(channels []*model.Channel, modelName string) []ChannelScore {
 	weights := DefaultScoringWeights()
 	scored := make([]ChannelScore, 0, len(channels))
 
-	for _, channel := range channels {
-		score := CalculateChannelScore(channel, modelName, weights)
-		scored = append(scored, ChannelScore{
-			Channel: channel,
-			Score:   score,
-		})
+	for _, ch := range channels {
+		if !isChannelRoutable(ch) {
+			continue
+		}
+		score := CalculateChannelScore(ch, modelName, weights)
+		scored = append(scored, ChannelScore{Channel: ch, Score: score})
 	}
 
-	// Sort by score (ascending - lower is better)
 	sort.Slice(scored, func(i, j int) bool {
 		return scored[i].Score < scored[j].Score
 	})
@@ -92,50 +112,36 @@ func GetScoredChannels(channels []*model.Channel, modelName string) []ChannelSco
 	return scored
 }
 
-// GetBestChannelByScore returns the channel with the lowest score (best cost/performance)
-func GetBestChannelByScore(group string, modelName string) (*model.Channel, error) {
-	// Get all available channels for this group and model
-	channels, err := getAllAvailableChannels(group, modelName)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(channels) == 0 {
-		return nil, nil
-	}
-
-	// Score and sort channels
-	scoredChannels := GetScoredChannels(channels, modelName)
-
-	// Return the best (lowest score) channel
-	return scoredChannels[0].Channel, nil
-}
-
-// GetChannelsByScore returns all channels sorted by score for retry logic
+// GetChannelsByScore returns routable channels sorted by score for failover logic.
 func GetChannelsByScore(group string, modelName string) ([]*model.Channel, error) {
-	// Get all available channels for this group and model
 	channels, err := getAllAvailableChannels(group, modelName)
 	if err != nil {
 		return nil, err
 	}
-
 	if len(channels) == 0 {
 		return nil, nil
 	}
 
-	// Score and sort channels
 	scoredChannels := GetScoredChannels(channels, modelName)
-
-	// Extract channels in score order
 	result := make([]*model.Channel, len(scoredChannels))
 	for i, sc := range scoredChannels {
 		result[i] = sc.Channel
 	}
-
 	return result, nil
 }
 
-// getAllAvailableChannels retrieves all enabled channels for a group and model
+// GetBestChannelByScore returns the single best routable channel.
+func GetBestChannelByScore(group string, modelName string) (*model.Channel, error) {
+	channels, err := GetChannelsByScore(group, modelName)
+	if err != nil {
+		return nil, err
+	}
+	if len(channels) == 0 {
+		return nil, nil
+	}
+	return channels[0], nil
+}
+
 func getAllAvailableChannels(group string, modelName string) ([]*model.Channel, error) {
 	if common.MemoryCacheEnabled {
 		return getAllAvailableChannelsFromCache(group, modelName)
@@ -143,36 +149,28 @@ func getAllAvailableChannels(group string, modelName string) ([]*model.Channel, 
 	return getAllAvailableChannelsFromDB(group, modelName)
 }
 
-// getAllAvailableChannelsFromCache gets channels from memory cache
 func getAllAvailableChannelsFromCache(group string, modelName string) ([]*model.Channel, error) {
 	model.ChannelSyncLock.RLock()
 	defer model.ChannelSyncLock.RUnlock()
 
-	// Try exact model name first
 	channelIDs := model.Group2model2channels[group][modelName]
-
-	// If not found, try normalized model name
 	if len(channelIDs) == 0 {
 		normalizedModel := ratio_setting.FormatMatchingModelName(modelName)
 		channelIDs = model.Group2model2channels[group][normalizedModel]
 	}
-
 	if len(channelIDs) == 0 {
 		return nil, nil
 	}
 
-	// Collect all channels
 	channels := make([]*model.Channel, 0, len(channelIDs))
 	for _, channelID := range channelIDs {
-		if channel, ok := model.ChannelsIDM[channelID]; ok {
-			channels = append(channels, channel)
+		if ch, ok := model.ChannelsIDM[channelID]; ok {
+			channels = append(channels, ch)
 		}
 	}
-
 	return channels, nil
 }
 
-// getAllAvailableChannelsFromDB gets channels from database
 func getAllAvailableChannelsFromDB(group string, modelName string) ([]*model.Channel, error) {
 	return model.GetChannelsByGroupAndModel(group, modelName)
 }
