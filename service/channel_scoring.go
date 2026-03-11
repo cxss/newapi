@@ -50,12 +50,11 @@ func isChannelRoutable(channel *model.Channel) bool {
 // CalculateChannelScore calculates a composite score for a channel.
 // Lower score is better. Channels with success rate < 90% receive a heavy penalty.
 func CalculateChannelScore(channel *model.Channel, modelName string, weights ScoringWeights) float64 {
-	modelPrice := ratio_setting.GetModelPrice(modelName, false)
-	if modelPrice == 0 {
+	modelPrice, ok := ratio_setting.GetModelPrice(modelName, false)
+	if !ok || modelPrice <= 0 {
 		modelPrice = 1.0
 	}
-	channelModelRatio := ratio_setting.GetChannelModelRatio(channel.Type, modelName)
-	effectivePrice := modelPrice * channelModelRatio
+	effectivePrice := modelPrice
 
 	// Logarithmic price normalization (range 0-100)
 	normalizedPrice := math.Log1p(effectivePrice) / math.Log1p(100.0)

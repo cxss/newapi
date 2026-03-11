@@ -82,7 +82,6 @@ func (p *RetryParam) ResetRetryNextTry() {
 //	         分组B, 优先级1
 func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, error) {
 	var channel *model.Channel
-	var err error
 	selectGroup := param.TokenGroup
 	userGroup := common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup)
 
