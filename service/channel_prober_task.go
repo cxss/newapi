@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -97,9 +98,14 @@ func probeChannel(ctx context.Context, channel *model.Channel) {
 			channel.Id, channel.Name, testModel, latencyMs,
 		))
 	} else {
+		// Log熔断事件
+		circuitNote := ""
+		if channel.IsTempDisabled() {
+			circuitNote = fmt.Sprintf(" CIRCUIT_OPEN until=%d", channel.TempDisabledUntil)
+		}
 		logger.LogWarn(ctx, fmt.Sprintf(
-			"prober: channel=%d name=%q model=%s http=%d fail consecutive=%d",
-			channel.Id, channel.Name, testModel, statusCode, channel.ConsecutiveFails,
+			"prober: channel=%d name=%q model=%s http=%d fail consecutive=%d%s",
+			channel.Id, channel.Name, testModel, statusCode, channel.ConsecutiveFails, circuitNote,
 		))
 	}
 }
@@ -116,6 +122,7 @@ func resolveProbeModel(channel *model.Channel) string {
 }
 
 // pingChannelHTTP sends a minimal chat completion request directly via HTTP.
+// Uses a single-space prompt and max_tokens=1 to minimize cost.
 // Returns (success, httpStatusCode).
 func pingChannelHTTP(channel *model.Channel, modelName string) (bool, int) {
 	baseURL := channel.GetBaseURL()
@@ -123,8 +130,9 @@ func pingChannelHTTP(channel *model.Channel, modelName string) (bool, int) {
 		return false, 0
 	}
 
+	// Single space prompt — valid but minimal, avoids content policy triggers
 	body := fmt.Sprintf(
-		`{"model":%q,"messages":[{"role":"user","content":"ping"}],"max_tokens":1}`,
+		`{"model":%q,"messages":[{"role":"user","content":" "}],"max_tokens":1}`,
 		modelName,
 	)
 
@@ -135,7 +143,6 @@ func pingChannelHTTP(channel *model.Channel, modelName string) (bool, int) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+channel.Key)
 
-	// Use a short-timeout client for probes to avoid blocking the prober goroutine
 	client := &http.Client{Timeout: proberTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -143,5 +150,19 @@ func pingChannelHTTP(channel *model.Channel, modelName string) (bool, int) {
 	}
 	defer resp.Body.Close()
 
-	return resp.StatusCode >= 200 && resp.StatusCode < 300, resp.StatusCode
+	// Read up to 512 bytes to verify the response contains a valid JSON structure
+	buf := make([]byte, 512)
+	n, _ := resp.Body.Read(buf)
+	body2xx := resp.StatusCode >= 200 && resp.StatusCode < 300
+
+	// Require both 2xx status AND a response body containing "choices" or "id"
+	// to guard against upstreams that return 200 with an error JSON body
+	if body2xx && n > 0 {
+		snippet := string(buf[:n])
+		if strings.Contains(snippet, `"choices"`) || strings.Contains(snippet, `"id"`) {
+			return true, resp.StatusCode
+		}
+	}
+
+	return false, resp.StatusCode
 }

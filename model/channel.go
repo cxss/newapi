@@ -467,16 +467,16 @@ func (channel *Channel) GetSuccessRate() float64 {
 }
 
 func (channel *Channel) UpdateMetrics(latency int, success bool) error {
-	// Update latency with exponential moving average (alpha = 0.3)
+	// Update latency with EMA alpha=0.2 (smoother, prevents single jitter from skewing score)
 	currentLatency := channel.GetLatency()
 	if currentLatency == 0 {
 		channel.Latency = &latency
 	} else {
-		newLatency := int(0.3*float64(latency) + 0.7*float64(currentLatency))
+		newLatency := int(0.8*float64(currentLatency) + 0.2*float64(latency))
 		channel.Latency = &newLatency
 	}
 
-	// Update success rate with exponential moving average (alpha = 0.2)
+	// Update success rate with EMA alpha=0.2 (approximates last ~50 requests)
 	currentSuccessRate := channel.GetSuccessRate()
 	var successValue float64
 	if success {
@@ -490,25 +490,30 @@ func (channel *Channel) UpdateMetrics(latency int, success bool) error {
 	// Update last check time
 	channel.LastCheckTime = common.GetTimestamp()
 
-	// Update consecutive failure count and temp disable logic
+	// Update consecutive failure count, temp disable, and status
 	if success {
 		channel.ConsecutiveFails = 0
-		// If recovering from temp disable (probe succeeded), clear it
+		// Recover from temp disable on successful probe
 		if channel.TempDisabledUntil > 0 {
 			channel.TempDisabledUntil = 0
+		}
+		// Restore enabled status if it was temp-disabled
+		if channel.Status == common.ChannelStatusTempDisabled {
+			channel.Status = common.ChannelStatusEnabled
 		}
 	} else {
 		channel.ConsecutiveFails++
 		if channel.ConsecutiveFails >= common.ChannelConsecutiveFailThreshold {
-			// Temp disable for cooldown duration
+			// Mark as Unstable (TempDisabled) and record cooldown
 			channel.TempDisabledUntil = common.GetTimestamp() + int64(common.ChannelTempDisableDuration)
-			channel.ConsecutiveFails = 0 // reset so next probe starts fresh
+			channel.Status = common.ChannelStatusTempDisabled
+			channel.ConsecutiveFails = 0
 		}
 	}
 
 	return DB.Model(channel).Select(
 		"latency", "success_rate", "last_check_time",
-		"consecutive_fails", "temp_disabled_until",
+		"consecutive_fails", "temp_disabled_until", "status",
 	).Updates(channel).Error
 }
 
