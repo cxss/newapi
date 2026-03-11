@@ -14,9 +14,9 @@ import (
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 )
 
-var group2model2channels map[string]map[string][]int // enabled channel
-var channelsIDM map[int]*Channel                     // all channels include disabled
-var channelSyncLock sync.RWMutex
+var Group2model2channels map[string]map[string][]int // enabled channel (exported for scoring)
+var ChannelsIDM map[int]*Channel                     // all channels include disabled (exported for scoring)
+var ChannelSyncLock sync.RWMutex                     // exported for scoring
 
 func InitChannelCache() {
 	if !common.MemoryCacheEnabled {
@@ -64,14 +64,14 @@ func InitChannelCache() {
 		}
 	}
 
-	channelSyncLock.Lock()
-	group2model2channels = newGroup2model2channels
-	//channelsIDM = newChannelId2channel
+	ChannelSyncLock.Lock()
+	Group2model2channels = newGroup2model2channels
+	//ChannelsIDM = newChannelId2channel
 	for i, channel := range newChannelId2channel {
 		if channel.ChannelInfo.IsMultiKey {
 			channel.Keys = channel.GetKeys()
 			if channel.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling {
-				if oldChannel, ok := channelsIDM[i]; ok {
+				if oldChannel, ok := ChannelsIDM[i]; ok {
 					// 存在旧的渠道，如果是多key且轮询，保留轮询索引信息
 					if oldChannel.ChannelInfo.IsMultiKey && oldChannel.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling {
 						channel.ChannelInfo.MultiKeyPollingIndex = oldChannel.ChannelInfo.MultiKeyPollingIndex
@@ -80,8 +80,8 @@ func InitChannelCache() {
 			}
 		}
 	}
-	channelsIDM = newChannelId2channel
-	channelSyncLock.Unlock()
+	ChannelsIDM = newChannelId2channel
+	ChannelSyncLock.Unlock()
 	common.SysLog("channels synced from database")
 }
 
@@ -99,16 +99,16 @@ func GetRandomSatisfiedChannel(group string, model string, retry int) (*Channel,
 		return GetChannel(group, model, retry)
 	}
 
-	channelSyncLock.RLock()
-	defer channelSyncLock.RUnlock()
+	ChannelSyncLock.RLock()
+	defer ChannelSyncLock.RUnlock()
 
 	// First, try to find channels with the exact model name.
-	channels := group2model2channels[group][model]
+	channels := Group2model2channels[group][model]
 
 	// If no channels found, try to find channels with the normalized model name.
 	if len(channels) == 0 {
 		normalizedModel := ratio_setting.FormatMatchingModelName(model)
-		channels = group2model2channels[group][normalizedModel]
+		channels = Group2model2channels[group][normalizedModel]
 	}
 
 	if len(channels) == 0 {
@@ -116,7 +116,7 @@ func GetRandomSatisfiedChannel(group string, model string, retry int) (*Channel,
 	}
 
 	if len(channels) == 1 {
-		if channel, ok := channelsIDM[channels[0]]; ok {
+		if channel, ok := ChannelsIDM[channels[0]]; ok {
 			return channel, nil
 		}
 		return nil, fmt.Errorf("数据库一致性错误，渠道# %d 不存在，请联系管理员修复", channels[0])
@@ -124,7 +124,7 @@ func GetRandomSatisfiedChannel(group string, model string, retry int) (*Channel,
 
 	uniquePriorities := make(map[int]bool)
 	for _, channelId := range channels {
-		if channel, ok := channelsIDM[channelId]; ok {
+		if channel, ok := ChannelsIDM[channelId]; ok {
 			uniquePriorities[int(channel.GetPriority())] = true
 		} else {
 			return nil, fmt.Errorf("数据库一致性错误，渠道# %d 不存在，请联系管理员修复", channelId)
@@ -145,7 +145,7 @@ func GetRandomSatisfiedChannel(group string, model string, retry int) (*Channel,
 	var sumWeight = 0
 	var targetChannels []*Channel
 	for _, channelId := range channels {
-		if channel, ok := channelsIDM[channelId]; ok {
+		if channel, ok := ChannelsIDM[channelId]; ok {
 			if channel.GetPriority() == targetPriority {
 				sumWeight += channel.GetWeight()
 				targetChannels = append(targetChannels, channel)
@@ -194,10 +194,10 @@ func CacheGetChannel(id int) (*Channel, error) {
 	if !common.MemoryCacheEnabled {
 		return GetChannelById(id, true)
 	}
-	channelSyncLock.RLock()
-	defer channelSyncLock.RUnlock()
+	ChannelSyncLock.RLock()
+	defer ChannelSyncLock.RUnlock()
 
-	c, ok := channelsIDM[id]
+	c, ok := ChannelsIDM[id]
 	if !ok {
 		return nil, fmt.Errorf("渠道# %d，已不存在", id)
 	}
@@ -212,10 +212,10 @@ func CacheGetChannelInfo(id int) (*ChannelInfo, error) {
 		}
 		return &channel.ChannelInfo, nil
 	}
-	channelSyncLock.RLock()
-	defer channelSyncLock.RUnlock()
+	ChannelSyncLock.RLock()
+	defer ChannelSyncLock.RUnlock()
 
-	c, ok := channelsIDM[id]
+	c, ok := ChannelsIDM[id]
 	if !ok {
 		return nil, fmt.Errorf("渠道# %d，已不存在", id)
 	}
@@ -226,19 +226,19 @@ func CacheUpdateChannelStatus(id int, status int) {
 	if !common.MemoryCacheEnabled {
 		return
 	}
-	channelSyncLock.Lock()
-	defer channelSyncLock.Unlock()
-	if channel, ok := channelsIDM[id]; ok {
+	ChannelSyncLock.Lock()
+	defer ChannelSyncLock.Unlock()
+	if channel, ok := ChannelsIDM[id]; ok {
 		channel.Status = status
 	}
 	if status != common.ChannelStatusEnabled {
-		// delete the channel from group2model2channels
-		for group, model2channels := range group2model2channels {
+		// delete the channel from Group2model2channels
+		for group, model2channels := range Group2model2channels {
 			for model, channels := range model2channels {
 				for i, channelId := range channels {
 					if channelId == id {
 						// remove the channel from the slice
-						group2model2channels[group][model] = append(channels[:i], channels[i+1:]...)
+						Group2model2channels[group][model] = append(channels[:i], channels[i+1:]...)
 						break
 					}
 				}
@@ -251,15 +251,15 @@ func CacheUpdateChannel(channel *Channel) {
 	if !common.MemoryCacheEnabled {
 		return
 	}
-	channelSyncLock.Lock()
-	defer channelSyncLock.Unlock()
+	ChannelSyncLock.Lock()
+	defer ChannelSyncLock.Unlock()
 	if channel == nil {
 		return
 	}
 
 	println("CacheUpdateChannel:", channel.Id, channel.Name, channel.Status, channel.ChannelInfo.MultiKeyPollingIndex)
 
-	println("before:", channelsIDM[channel.Id].ChannelInfo.MultiKeyPollingIndex)
-	channelsIDM[channel.Id] = channel
-	println("after :", channelsIDM[channel.Id].ChannelInfo.MultiKeyPollingIndex)
+	println("before:", ChannelsIDM[channel.Id].ChannelInfo.MultiKeyPollingIndex)
+	ChannelsIDM[channel.Id] = channel
+	println("after :", ChannelsIDM[channel.Id].ChannelInfo.MultiKeyPollingIndex)
 }

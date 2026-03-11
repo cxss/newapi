@@ -115,11 +115,12 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			}
 			logger.LogDebug(param.Ctx, "Auto selecting group: %s, priorityRetry: %d", autoGroup, priorityRetry)
 
-			channel, _ = model.GetRandomSatisfiedChannel(autoGroup, param.ModelName, priorityRetry)
-			if channel == nil {
+			// Use score-based selection instead of priority-based
+			channels, err := GetChannelsByScore(autoGroup, param.ModelName)
+			if err != nil || len(channels) == 0 {
 				// Current group has no available channel for this model, try next group
 				// 当前分组没有该模型的可用渠道，尝试下一个分组
-				logger.LogDebug(param.Ctx, "No available channel in group %s for model %s at priorityRetry %d, trying next group", autoGroup, param.ModelName, priorityRetry)
+				logger.LogDebug(param.Ctx, "No available channel in group %s for model %s, trying next group", autoGroup, param.ModelName)
 				// 重置状态以尝试下一个分组
 				common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroupIndex, i+1)
 				common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroupRetryIndex, 0)
@@ -128,9 +129,17 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 				param.SetRetry(0)
 				continue
 			}
+
+			// Select channel based on retry index (for failover)
+			retryIndex := priorityRetry
+			if retryIndex >= len(channels) {
+				retryIndex = len(channels) - 1
+			}
+			channel = channels[retryIndex]
+
 			common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroup, autoGroup)
 			selectGroup = autoGroup
-			logger.LogDebug(param.Ctx, "Auto selected group: %s", autoGroup)
+			logger.LogDebug(param.Ctx, "Auto selected group: %s, channel: %d (score-based, retry: %d)", autoGroup, channel.Id, retryIndex)
 
 			// Prepare state for next retry
 			// 为下一次重试准备状态
@@ -153,10 +162,21 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			break
 		}
 	} else {
-		channel, err = model.GetRandomSatisfiedChannel(param.TokenGroup, param.ModelName, param.GetRetry())
+		// Use score-based selection for non-auto groups
+		channels, err := GetChannelsByScore(param.TokenGroup, param.ModelName)
 		if err != nil {
 			return nil, param.TokenGroup, err
 		}
+		if len(channels) == 0 {
+			return nil, param.TokenGroup, nil
+		}
+
+		// Select channel based on retry index (for failover)
+		retryIndex := param.GetRetry()
+		if retryIndex >= len(channels) {
+			retryIndex = len(channels) - 1
+		}
+		channel = channels[retryIndex]
 	}
 	return channel, selectGroup, nil
 }

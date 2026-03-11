@@ -143,6 +143,46 @@ func GetChannel(group string, model string, retry int) (*Channel, error) {
 	return &channel, err
 }
 
+// GetChannelsByGroupAndModel returns all enabled channels for a specific group and model
+func GetChannelsByGroupAndModel(group string, model string) ([]*Channel, error) {
+	var abilities []Ability
+
+	channelQuery, err := getChannelQuery(group, model, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get all abilities (not just one priority level)
+	err = channelQuery.Find(&abilities).Error
+	if err != nil {
+		return nil, err
+	}
+
+	if len(abilities) == 0 {
+		return nil, nil
+	}
+
+	// Collect unique channel IDs
+	channelIDMap := make(map[int]bool)
+	for _, ability := range abilities {
+		channelIDMap[ability.ChannelId] = true
+	}
+
+	// Fetch all channels
+	channelIDs := make([]int, 0, len(channelIDMap))
+	for id := range channelIDMap {
+		channelIDs = append(channelIDs, id)
+	}
+
+	var channels []*Channel
+	err = DB.Where("id IN ?", channelIDs).Find(&channels).Error
+	if err != nil {
+		return nil, err
+	}
+
+	return channels, nil
+}
+
 func (channel *Channel) AddAbilities(tx *gorm.DB) error {
 	models_ := strings.Split(channel.Models, ",")
 	groups_ := strings.Split(channel.Group, ",")

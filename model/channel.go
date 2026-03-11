@@ -53,6 +53,11 @@ type Channel struct {
 
 	OtherSettings string `json:"settings" gorm:"column:settings"` // 其他设置，存储azure版本等不需要检索的信息，详见dto.ChannelOtherSettings
 
+	// Smart routing metrics
+	Latency       *int     `json:"latency" gorm:"default:0"`        // Average latency in milliseconds
+	SuccessRate   *float64 `json:"success_rate" gorm:"default:1.0"` // Success rate (0.0 - 1.0)
+	LastCheckTime int64    `json:"last_check_time" gorm:"bigint;default:0"`
+
 	// cache info
 	Keys []string `json:"-" gorm:"-"`
 }
@@ -443,6 +448,48 @@ func (channel *Channel) GetStatusCodeMapping() string {
 		return ""
 	}
 	return *channel.StatusCodeMapping
+}
+
+func (channel *Channel) GetLatency() int {
+	if channel.Latency == nil {
+		return 0
+	}
+	return *channel.Latency
+}
+
+func (channel *Channel) GetSuccessRate() float64 {
+	if channel.SuccessRate == nil {
+		return 1.0 // Default to 100% success rate if not set
+	}
+	return *channel.SuccessRate
+}
+
+func (channel *Channel) UpdateMetrics(latency int, success bool) error {
+	// Update latency with exponential moving average (alpha = 0.3)
+	currentLatency := channel.GetLatency()
+	if currentLatency == 0 {
+		channel.Latency = &latency
+	} else {
+		newLatency := int(0.3*float64(latency) + 0.7*float64(currentLatency))
+		channel.Latency = &newLatency
+	}
+
+	// Update success rate with exponential moving average (alpha = 0.2)
+	currentSuccessRate := channel.GetSuccessRate()
+	var successValue float64
+	if success {
+		successValue = 1.0
+	} else {
+		successValue = 0.0
+	}
+	newSuccessRate := 0.2*successValue + 0.8*currentSuccessRate
+	channel.SuccessRate = &newSuccessRate
+
+	// Update last check time
+	channel.LastCheckTime = common.GetTimestamp()
+
+	// Save to database
+	return DB.Model(channel).Select("latency", "success_rate", "last_check_time").Updates(channel).Error
 }
 
 func (channel *Channel) Insert() error {

@@ -196,6 +196,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 
 		addUsedChannel(c, channel.Id)
+
+		// Record request start time for latency calculation
+		requestStartTime := time.Now()
+
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
 		if bodyErr != nil {
 			// Ensure consistent 413 for oversized bodies even when error occurs later (e.g., retry path)
@@ -221,11 +225,26 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		if newAPIError == nil {
 			relayInfo.LastError = nil
+			// Update channel metrics on success
+			latency := int(time.Since(requestStartTime).Milliseconds())
+			go func() {
+				if err := channel.UpdateMetrics(latency, true); err != nil {
+					logger.LogError(c, fmt.Sprintf("Failed to update channel metrics: %s", err.Error()))
+				}
+			}()
 			return
 		}
 
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		relayInfo.LastError = newAPIError
+
+		// Update channel metrics on failure
+		latency := int(time.Since(requestStartTime).Milliseconds())
+		go func() {
+			if err := channel.UpdateMetrics(latency, false); err != nil {
+				logger.LogError(c, fmt.Sprintf("Failed to update channel metrics: %s", err.Error()))
+			}
+		}()
 
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
 
